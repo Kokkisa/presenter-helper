@@ -1,0 +1,522 @@
+=======================================================================
+  INTERVIEW Q&A BANK — Telemetry Anomaly Pipeline
+  Project: github.com/Kokkisa/telemetry-anomaly-pipeline
+  Role: Senior Python Developer — WebCreek (Real-Time Data Platforms)
+=======================================================================
+
+FORMAT: Read the Q, pause, answer in your own words, then check against A.
+Feed into LCA for live interview support.
+
+-----------------------------------------------------------------------
+SECTION 1 — PROJECT OVERVIEW & MOTIVATION
+-----------------------------------------------------------------------
+
+Q1. Can you walk me through this project?
+
+A: This is a real-time streaming pipeline for LPG pipeline telemetry.
+   Coriolis mass flow meters installed at pipeline segments — Kondapalli
+   inlet, Rajahmundry transfer line, Mangalore compressor discharge —
+   continuously stream four parameters: mass flow rate, temperature,
+   pressure, and fluid density.
+   
+   The pipeline does three things: first it cleans the stream — rejects
+   malformed packets and deduplicates Kafka redeliveries. Then it runs
+   anomaly detection on every individual reading using a rolling Z-score.
+   Finally it aggregates into 1-minute windows and runs a second anomaly
+   check on the window summaries to catch sustained drift.
+   
+   I built it because the WebCreek assessment asked for exactly this —
+   streaming telemetry deduplication, aggregation, and anomaly detection.
+   And it mirrors what I actually built at HPCL at production scale.
+
+---
+
+Q2. Why did you build this before the interview?
+
+A: I read the assessment brief carefully. The problem described —
+   high-volume telemetry ingestion, deduplication, aggregation, anomaly
+   detection — is something I've done at production scale at HPCL across
+   55 plants processing 1.5 million cylinder operations daily. I wanted
+   to show I understand the problem architecturally, not just
+   theoretically. Building it in advance also let me think through the
+   design decisions properly rather than under time pressure.
+
+---
+
+Q3. How does this connect to your HPCL experience?
+
+A: Directly. At HPCL I deployed two IoT anomaly detection systems in
+   production. One used Isolation Forest on IoT sensor streams for
+   bottom corrosion detection across 1.5 million daily cylinder
+   operations — a safety blind spot completely undetectable by human
+   inspection. The second was a predictive maintenance system across
+   55 plants using continuous IoT sensor data with dual-layer rule-based
+   and ML alerting replacing manual gauge monitoring.
+   
+   The mass flow meter parameters in this project — pressure ranges of
+   8.5 to 14.5 bar, flow rates of 2,000 to 5,600 kg/h, LPG density
+   around 508 to 522 kg/m³ — are modelled on real LPG transfer line
+   specifications I worked with. The plant names KDL, RJY, MNG are
+   Kondapalli, Rajahmundry, and Mangalore — three of my actual postings.
+
+---
+
+-----------------------------------------------------------------------
+SECTION 2 — ANOMALY DETECTION (ALGORITHM DEEP DIVE)
+-----------------------------------------------------------------------
+
+Q4. What anomaly detection algorithm did you use and why?
+
+A: Rolling Z-score with two detectors — per-record and post-window.
+   
+   Z = (observed_value − rolling_mean) / rolling_std
+   Flag if |Z| > 3.0
+   
+   I chose Z-score for four reasons:
+   One — no training data required. Works from the first 10 readings,
+   unlike Isolation Forest which needs historical batch training.
+   Two — truly streaming. Computes in O(1) per record using Welford's
+   online algorithm for numerically stable incremental mean and variance.
+   Three — human interpretable. I can tell an engineer "this reading
+   was 4.5 sigma from normal" and they immediately understand severity.
+   Four — stateless per sensor. Each sensor maintains its own rolling
+   window independently, scales to thousands of sensors linearly.
+
+---
+
+Q5. Why not Isolation Forest? You mentioned you used it at HPCL.
+
+A: Isolation Forest is excellent and it's what I used at HPCL — but it
+   requires batch training on historical data first. You need to fit the
+   forest before you can score new points. In a fresh streaming pipeline
+   with no prior history, you can't use it on day one.
+   
+   Z-score warms up in 10 readings. In production I'd layer Isolation
+   Forest on top once we have 30 days of baseline data — use Z-score for
+   immediate alerting from cold start, retrain an Isolation Forest model
+   weekly on the accumulated history, then run both in parallel.
+
+---
+
+Q6. What is Welford's algorithm and why did you use it?
+
+A: Welford's is an online algorithm for computing mean and variance
+   incrementally — one data point at a time — without accumulating the
+   full history in memory.
+   
+   The naive approach — sum all values, divide by count — suffers from
+   catastrophic cancellation when values are large and variance is small.
+   For example pressure readings around 11.0 bar with variance of 0.01
+   — the subtraction loses precision in floating point arithmetic.
+   
+   Welford's updates mean and variance in a single pass, numerically
+   stable, O(1) per update, O(1) memory regardless of history length.
+   For industrial sensors streaming at high frequency, this matters.
+
+---
+
+Q7. What's the difference between your two anomaly detectors?
+
+A: They catch different failure modes.
+   
+   The per-record Z-score catches sudden spikes — a pressure reading
+   that instantly jumps from 11 bar to 45 bar. It fires within one
+   second of the anomalous reading arriving.
+   
+   The window spike detector catches sustained drift — a sensor running
+   2 bar high for 30 consecutive minutes. Each individual reading might
+   be within 3 sigma of its local baseline, but compared to the
+   30-window historical norm the sustained elevation is clearly anomalous.
+   
+   In practice on LPG pipelines, sudden spikes often indicate mechanical
+   events — valve slam, pump cavitation, pressure surge. Sustained drift
+   often indicates calibration drift, slow leak, or gradual blockage.
+   Two different engineering problems, two different detectors.
+
+---
+
+Q8. What other algorithms could you use for this problem?
+
+A: Several depending on the constraints:
+   
+   EWMA — Exponentially Weighted Moving Average. Adapts faster to slow
+   drift than Z-score because recent readings get higher weight.
+   Strong alternative for industrial sensors where baseline shifts
+   gradually over hours or days. Would be my first production upgrade.
+   
+   Isolation Forest — ensemble method, excellent at catching multivariate
+   anomalies (pressure AND temperature both unusual simultaneously).
+   Needs batch training but very powerful once warmed up.
+   
+   IQR — Interquartile Range. Simpler than Z-score, no normality
+   assumption, robust to outliers in the baseline itself. Good for
+   sensors with non-Gaussian distributions.
+   
+   LSTM Autoencoder — learns deep temporal patterns, excellent for
+   seasonal or cyclical data. High operational overhead — needs GPU,
+   training pipeline, model versioning, retraining schedule. Overkill
+   for this use case but justified for complex multivariate anomalies.
+   
+   STL decomposition — Seasonal Trend decomposition. Good when sensor
+   data has known periodicity — daily temperature cycles for example.
+
+---
+
+Q9. How do you handle the baseline warm-up period?
+
+A: The detector has a minimum baseline samples threshold — set to 10 by
+   default in config.py. Until 10 readings have been collected for a
+   given sensor and metric pair, no alerts are fired regardless of how
+   extreme the value looks.
+   
+   This prevents false positives on startup when the rolling window is
+   too small to compute a meaningful standard deviation. The cost is a
+   10-reading blind period per sensor — acceptable because the pipeline
+   starts fresh and those first readings are establishing the baseline.
+
+---
+
+-----------------------------------------------------------------------
+SECTION 3 — DEDUPLICATION
+-----------------------------------------------------------------------
+
+Q10. How does your deduplication work?
+
+A: TTL-bounded seen-set using two data structures in combination.
+   A Python dict for O(1) average-case lookup by message_id, and a
+   deque for O(1) eviction of expired entries.
+   
+   When a record arrives, I check the dict — if the message_id is
+   already there, it's a duplicate, drop it. If not, I insert it into
+   both the dict and the deque with the current timestamp.
+   
+   Every time a new record arrives I also walk the front of the deque
+   and pop any entries older than the TTL window (5 minutes by default).
+   This keeps memory bounded without a background cleanup thread.
+   
+   The cache is also hard-capped at 100,000 entries — if we hit that
+   limit, the oldest entry is evicted regardless of TTL.
+
+---
+
+Q11. Why a deque and dict together instead of just a dict?
+
+A: The dict alone gives fast lookup but no efficient way to find and
+   remove expired entries. You'd have to scan all keys on every insert —
+   O(n) per record.
+   
+   The deque maintains insertion order — oldest entries are always at
+   the front. So eviction is O(k) where k is only the number of entries
+   that actually expired, not the full cache size. In practice k is
+   very small relative to cache size.
+
+---
+
+Q12. What's the alternative for very high cardinality — millions of sensors?
+
+A: Bloom filter. Fixed memory regardless of cardinality, O(1) lookup,
+   O(1) insert. The trade-off is a configurable false positive rate —
+   around 0.1% with typical settings, meaning 1 in 1000 legitimate
+   records gets incorrectly flagged as a duplicate and dropped.
+   
+   For telemetry pipelines where occasional missed records are less
+   costly than OOM crashes, that's an acceptable trade-off. The code has
+   this documented as a comment in deduplicator.py with the pybloom-live
+   implementation pattern ready to swap in.
+
+---
+
+Q13. Why manual Kafka offset commit instead of auto-commit?
+
+A: Auto-commit advances the offset on a timer regardless of whether
+   the message was successfully processed. If the pipeline crashes
+   between the auto-commit and the actual processing, that record is
+   silently lost — at-most-once semantics.
+   
+   Manual commit means I commit the offset only after the record has
+   been deduplicated, processed, and added to the aggregation window.
+   Combined with the deduplicator, this gives effectively exactly-once
+   semantics — Kafka provides at-least-once delivery, the deduplicator
+   handles the resulting duplicates idempotently.
+
+---
+
+-----------------------------------------------------------------------
+SECTION 4 — AGGREGATION
+-----------------------------------------------------------------------
+
+Q14. What type of windowing did you implement and why?
+
+A: Tumbling windows — non-overlapping, fixed-size 60-second buckets.
+   Each record belongs to exactly one window. At window close I compute
+   mean, min, max, standard deviation, and p95.
+   
+   I chose tumbling over sliding because the use case is operational
+   monitoring — you want a clean "what happened in the last minute"
+   summary, not overlapping summaries that double-count records.
+   Sliding windows are better for things like fraud detection where you
+   want continuous rolling risk scores.
+
+---
+
+Q15. What's the boundary bug you avoided in the aggregator?
+
+A: A common mistake in tumbling window implementations is to call
+   flush(), collect all records currently in the buffer, then prune old
+   records. The bug is that pruning happens based on age from now —
+   which can include records that belong to the next window.
+   
+   The correct approach is to first determine the window boundary
+   (window_start + window_seconds), collect only records with timestamps
+   at or before that boundary, prune exactly those records from the
+   buffer, and start the next window at the boundary — not at now().
+   
+   If you start the next window at now() instead of the boundary, you
+   accumulate drift. After 60 windows the window start has shifted by
+   seconds and your summaries no longer align with clean minute marks.
+
+---
+
+Q16. Why track p95 in addition to mean and max?
+
+A: Mean hides the tail. In a 1-minute window with 400 readings, if 20
+   readings spike to 50 bar while the rest are at 11 bar, the mean
+   stays around 12.4 — looks fine. Max catches the spike but doesn't
+   tell you how widespread it was.
+   
+   P95 tells you "95% of readings were at or below this value" — so
+   if p95 is 14 bar when normal max is 12, you know 5% of readings
+   were elevated. That's 20 readings in a minute — not a one-off spike,
+   it's a pattern. For SLA monitoring and capacity planning, p95 and p99
+   are the standard metrics.
+
+---
+
+-----------------------------------------------------------------------
+SECTION 5 — ARCHITECTURE & PRODUCTION READINESS
+-----------------------------------------------------------------------
+
+Q17. How would you scale this to handle millions of records per second?
+
+A: Several layers:
+   
+   First — Kafka partitioning. Partition by sensor_id so all readings
+   from one sensor always go to the same consumer. This keeps the
+   deduplication and aggregation state local to one partition consumer
+   — no cross-node coordination needed.
+   
+   Second — horizontal scaling. Run N consumer instances, each handling
+   M partitions. The deduplicator and aggregator state is per-partition,
+   so no shared state between instances.
+   
+   Third — replace the in-process aggregator with a proper streaming
+   framework. Kafka Streams or Flink both have native windowing operators
+   with state stores that survive consumer restarts. The current in-memory
+   aggregator loses window state on crash.
+   
+   Fourth — for the deduplicator at very high cardinality, move from
+   the in-process dict to Redis with TTL keys. Then multiple consumer
+   instances share dedup state correctly.
+
+---
+
+Q18. What would you change to make this truly production ready?
+
+A: Five things:
+   
+   One — replace in-memory aggregator state with Kafka Streams or Flink
+   state store. Current implementation loses window data on crash.
+   
+   Two — add schema validation via Avro or Protobuf with a Schema
+   Registry. Currently we validate fields manually in parse_message().
+   
+   Three — add proper observability. Prometheus metrics for throughput,
+   lag, alert rate, dedup rate. The pipeline already logs stats every
+   30 seconds but that's not queryable.
+   
+   Four — replace print-based alert sink with a real integration —
+   PagerDuty for critical alerts, InfluxDB or TimescaleDB for all
+   records and windows, so dashboards can query the data.
+   
+   Five — EWMA-based adaptive thresholds. Current Z-score uses a fixed
+   3-sigma threshold. A sensor that gradually drifts over weeks would
+   have its baseline drift with it and never alert. EWMA with a slower
+   decay rate would catch this.
+
+---
+
+Q19. How does your pipeline handle a sensor going offline?
+
+A: Currently it doesn't — that's a gap I'd flag as a production
+   improvement. If a sensor stops sending, the pipeline simply stops
+   receiving records for that sensor_id. No alert is raised.
+   
+   The fix is a heartbeat monitor — a separate thread that tracks the
+   last-seen timestamp per sensor and fires a MISSING_DATA alert if
+   any sensor hasn't reported within N seconds. That alert type is
+   already defined in the AnomalyType enum in models.py — it just
+   needs the heartbeat thread wired in.
+
+---
+
+Q20. What does your test suite cover?
+
+A: 23 tests across four classes.
+   
+   TestParsing — 6 tests covering valid records, invalid JSON, missing
+   fields, non-numeric values, null values, and unix epoch timestamps.
+   
+   TestDeduplicator — 6 tests covering first occurrence acceptance,
+   duplicate rejection, TTL expiry (same ID accepted again after TTL),
+   capacity eviction at max_cache_size, and stats accuracy.
+   
+   TestAggregator — 5 tests covering window timing (no flush before
+   window closes), correct mean/min/max computation, multi-sensor
+   isolation, minimum samples guard, and the stats helper functions.
+   
+   TestAnomalyDetector — 6 tests covering baseline warm-up suppression,
+   normal values producing no alert, spike triggering alert, alert
+   containing correct baseline stats, window spike detector, and the
+   composite detector combining both.
+
+---
+
+-----------------------------------------------------------------------
+SECTION 6 — HPCL CONNECTION (use these when they ask about experience)
+-----------------------------------------------------------------------
+
+Q21. You say this mirrors your HPCL work. What specifically?
+
+A: Two direct parallels:
+   
+   The IoT sensor corrosion detection at HPCL used Isolation Forest on
+   continuous sensor streams from electromagnetic sensors on cylinder
+   bottoms — same streaming anomaly detection problem, different
+   algorithm because we had years of labeled training data.
+   
+   The predictive maintenance system processed continuous IoT sensor
+   data streams across 55 plants with dual-layer alerting — rule-based
+   thresholds as the first layer, ML anomaly detection as the second.
+   That dual-layer pattern is what the two detectors in this pipeline
+   represent — per-record Z-score as the fast first layer, window spike
+   detector as the slower but more sensitive second layer.
+   
+   The scale was different — 1.5 million cylinder operations daily,
+   55 plants, network-wide. But the architectural pattern is identical.
+
+---
+
+Q22. What were the business outcomes of your HPCL anomaly detection work?
+
+A: The corrosion detection system closed a safety blind spot that was
+   completely undetectable by human visual inspection at 3,200 cylinders
+   per hour. Before the system, corrosion on cylinder bottoms was only
+   caught during periodic manual spot checks — maybe 1% of cylinders
+   inspected per shift. After deployment, 100% of cylinders were screened
+   continuously at full throughput.
+   
+   The predictive maintenance system reduced unplanned equipment downtime
+   network-wide across 55 plants. Replacing manual gauge monitoring with
+   continuous sensor streams meant we caught degradation trends days
+   before they became failures — rather than discovering them when
+   equipment stopped working mid-shift.
+   
+   The $7.7M investigation was a separate analytics project — multivariate
+   correlation analysis across 10 years of operational records — which
+   also involved continuous sensor data analysis, just historical rather
+   than streaming.
+
+---
+
+-----------------------------------------------------------------------
+SECTION 7 — TOUGH QUESTIONS (be ready for these)
+-----------------------------------------------------------------------
+
+Q23. You said you're "zero at coding" — how did you build this?
+
+A: I'm not a software engineer by training — I'm an operations leader
+   who moved into data science. I built production ML systems at HPCL
+   but always with a focus on the problem and the solution, not the
+   syntax.
+   
+   For this project I worked with AI tools to implement the code —
+   the same way a senior engineer uses Stack Overflow, documentation,
+   and colleagues. What I brought was the domain knowledge: knowing that
+   the right dedup structure is a TTL-bounded seen-set, knowing that
+   Z-score is the right algorithm for cold-start streaming anomaly
+   detection, knowing the difference between tumbling and sliding windows
+   and when to use each, knowing what p95 means for SLA monitoring.
+   
+   I can explain every design decision in this codebase because I made
+   those decisions. I understand what the code does and why — I just
+   didn't type every line myself. In a team environment I'd be working
+   with engineers who write code faster than me — my value is knowing
+   what to build and why.
+
+---
+
+Q24. The code has no persistence — windows and alerts just print. Isn't that incomplete?
+
+A: Intentionally. The pipeline.py has callback hooks — on_alert and
+   on_window — that are currently wired to print statements. These are
+   meant to be replaced with real sinks: InfluxDB writer, TimescaleDB
+   insert, PagerDuty webhook, Kafka topic producer.
+   
+   I separated the sink from the logic deliberately — the pipeline
+   doesn't care where alerts go. That's a dependency inversion pattern.
+   Adding a real database sink is a one-function change without touching
+   any of the core logic.
+
+---
+
+Q25. Why Python and not Java or Go for a high-performance streaming pipeline?
+
+A: For this use case — demonstrating the architecture and logic — Python
+   is the right choice. The assessment asked for Python specifically.
+   
+   In production, if throughput exceeded what a Python consumer could
+   handle — roughly 50,000 to 100,000 records per second per process —
+   I'd move the hot path to Java or Go. The deduplication and aggregation
+   logic translates directly to Kafka Streams (Java) or a Go consumer
+   with Redis state.
+   
+   But at the throughput levels of most industrial telemetry pipelines —
+   even large ones — Python with asyncio or multiprocessing is entirely
+   sufficient. Our HPCL network with 55 plants and multiple sensors per
+   plant would peak at maybe 5,000 records per second. Python handles
+   that comfortably.
+
+---
+
+=======================================================================
+  QUICK REFERENCE — KEY NUMBERS TO REMEMBER
+=======================================================================
+
+  Z-score threshold    : 3.0 sigma  (flags top 0.3% of readings)
+  Rolling window       : 20 samples per sensor/metric pair
+  Baseline warm-up     : 10 samples before first alert
+  Dedup TTL            : 300 seconds (5 minutes)
+  Dedup cache max      : 100,000 entries
+  Aggregation window   : 60 seconds tumbling
+  Window history       : 30 windows for post-window spike detection
+  Test coverage        : 23 tests, all passing
+  Sensors in demo      : 5 sensor IDs, 13 sensor/metric pairs
+  MFM flow range       : 2,000 – 5,600 kg/h
+  MFM pressure range   : 8.5 – 14.5 bar
+  MFM temp range       : 29 – 52 °C
+  LPG density range    : 508 – 522 kg/m³
+  Injected fault rates : 4% malformed, 5% duplicate, 3% anomaly
+
+=======================================================================
+  OPENING LINE FOR INTERVIEW
+=======================================================================
+
+  "I read the assessment brief before coming in. The core problem —
+  streaming telemetry deduplication, aggregation, and anomaly detection
+  — is something I've built at production scale at HPCL across 55 plants.
+  So I went ahead and built the Python pipeline architecture for it.
+  Want me to walk you through it?"
+
+  Then open: github.com/Kokkisa/telemetry-anomaly-pipeline
+
+=======================================================================

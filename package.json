@@ -1,0 +1,47 @@
+{
+  "name": "presenter-helper",
+  "version": "0.1.0",
+  "description": "Hardware input device service manager",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder",
+    "setup": "electron setup.js",
+    "embed": "electron embed.js",
+    "make-icon": "node scripts/generate-icon.js && electron-icon-builder --input=assets/icon.png --output=assets"
+  },
+  "devDependencies": {
+    "electron": "^28.2.3",
+    "electron-builder": "^24.6.0",
+    "electron-icon-builder": "^2.0.1"
+  },
+  "dependencies": {
+    "pdf-parse": "^1.1.1"
+  },
+  "build": {
+    "appId": "com.presenter.helper",
+    "productName": "Presenter Helper",
+    "win": {
+      "target": ["nsis"],
+      "icon": "assets/icons/win/icon.ico"
+    },
+    "mac": {
+      "icon": "assets/icons/mac/icon.icns"
+    },
+    "nsis": {
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "oneClick": false
+    },
+    "files": [
+      "**/*",
+      "!*.md",
+      "!.claude/",
+      "!docs/",
+      "!scripts/",
+      "!assets/icon.png",
+      "!setup.js",
+      "!embed.js"
+    ]
+  }
+}

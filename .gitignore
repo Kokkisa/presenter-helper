@@ -1,0 +1,15 @@
+node_modules/
+dist/
+*.exe
+.env
+*.log
+.claude/
+start.log
+
+# App data files
+tier1.json
+tier2.json
+chunks.json
+settings.json
+history.json
+feedback.json

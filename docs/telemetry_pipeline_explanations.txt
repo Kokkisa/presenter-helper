@@ -1,0 +1,320 @@
+=======================================================================
+  TELEMETRY PIPELINE — PLAIN ENGLISH EXPLANATIONS
+  For: WebCreek Senior Python Developer Interview — Friday May 15 2026
+  Feed into LCA alongside telemetry_pipeline_QA_bank.txt
+=======================================================================
+
+-----------------------------------------------------------------------
+WHAT IS TELEMETRY
+-----------------------------------------------------------------------
+
+Telemetry means readings sent from a remote device. At HPCL, flow meters,
+pressure transmitters, and temperature gauges were all telemetry sources.
+Each reading has a sensor ID, a value, a unit, and a timestamp. The word
+sounds fancy but it just means sensor data sent over a wire.
+
+-----------------------------------------------------------------------
+WHAT IS THE OVERALL PROBLEM THIS PIPELINE SOLVES
+-----------------------------------------------------------------------
+
+Industrial LPG pipelines have Coriolis mass flow meters installed at every
+segment streaming mass flow rate, temperature, pressure, and fluid density
+every few seconds 24 hours a day. The raw stream has three problems:
+
+Problem 1 - Duplicate records. Cause: Kafka at-least-once delivery and
+SCADA retry on comm timeout. Solution: TTL-bounded deduplication.
+
+Problem 2 - Malformed records. Cause: Truncated packets, COMM_ERROR
+payloads, sensor offline. Solution: Parse-time validation with
+MalformedRecord sentinel.
+
+Problem 3 - Undetected anomalies. Cause: Pressure surges, flow blockages,
+cavitation events. Solution: Rolling Z-score plus post-window spike
+detection.
+
+-----------------------------------------------------------------------
+WHAT IS DEDUPLICATION
+-----------------------------------------------------------------------
+
+Sometimes the same reading gets sent twice. Maybe the network glitched and
+the sensor retried. Maybe Kafka delivered the message twice. If you do not
+filter duplicates, your averages get skewed.
+
+Deduplication means if I have already seen this exact message ID in the
+last 5 minutes, throw it away. Think of it like a post office saying I
+already delivered this letter, I am not delivering it again.
+
+-----------------------------------------------------------------------
+WHAT IS AGGREGATION
+-----------------------------------------------------------------------
+
+You do not want to store or analyze 10,000 raw readings per minute per
+sensor. Instead, every 60 seconds you summarize: in the last minute,
+sensor KDL-01 sent 487 pressure readings. The average was 12.4 bar. The
+highest was 14.1. The 95th percentile was 13.2. That summary is called a
+window. This is aggregation - collapsing many readings into one meaningful
+summary per time window.
+
+-----------------------------------------------------------------------
+WHAT IS ANOMALY DETECTION
+-----------------------------------------------------------------------
+
+You want the system to automatically flag if something looks wrong. The
+simplest way is to track the last 20 readings for a sensor and calculate
+the average and spread. If a new reading is 3 standard deviations further
+away from the average than normal, flag it. This is the Z-score. It
+answers how unusual is this reading compared to what has been normal
+recently. A Z-score of 0 means perfectly normal. A Z-score of 3 or more
+means something strange is happening.
+
+-----------------------------------------------------------------------
+WHAT IS ARCHITECTURE
+-----------------------------------------------------------------------
+
+Architecture is just a fancy word for what happens, in what order, and
+why. When someone says walk me through the architecture they are asking:
+what happens first, what happens next, what does each step do, and why is
+it in that position in the sequence.
+
+The flow: sensor sends reading, lands in Kafka topic, ingestor reads and
+validates it, deduplicator checks if seen before, anomaly detector checks
+if unusual, window aggregator collects into 1-minute bucket, window spike
+detector checks if bucket summary is unusual, alerts go to engineers,
+window summaries go to dashboards.
+
+-----------------------------------------------------------------------
+WHAT EACH FILE DOES
+-----------------------------------------------------------------------
+
+models.py - The paper forms. Defines four data shapes used by every other
+file: TelemetryRecord (valid sensor reading), MalformedRecord (rejection
+slip for broken records), AggWindow (1-minute summary form), Alert
+(incident report form). Read this file first because everything else
+refers to these four forms.
+
+config.py - The settings board. All constants in one place with names and
+reasons. Nothing hardcoded in business logic. frozen=True means config
+cannot change at runtime. Singleton CONFIG object imported by all files.
+Senior signal: no magic numbers scattered across files.
+
+ingestor.py - The loading dock. Reads from Kafka in production, generates
+fake MFM data in simulation mode. The most important function is
+parse_message() which does six validation checks on every raw message:
+valid JSON, is a dictionary, has all required fields, value is numeric,
+value is finite (not NaN or infinity), timestamp is parseable. Returns
+TelemetryRecord or MalformedRecord, never crashes.
+
+deduplicator.py - The post office clerk. Maintains a seen-set of message
+IDs from the last 5 minutes. Uses dict for O(1) lookup and deque for O(1)
+eviction of expired entries. Memory hard-capped at 100,000 entries.
+Thread-safe via lock.
+
+aggregator.py - The shift supervisor log. Collects readings into 1-minute
+tumbling windows per sensor/metric pair. Computes mean, min, max, std_dev,
+p95 when window closes. Boundary-correct: collects values before pruning,
+resets window start to boundary not to now. Flush is called every 10
+seconds to check if any windows have closed.
+
+anomaly.py - The alert system. Two detectors: RollingZScoreDetector checks
+every individual reading against last 20 readings, fires alert if Z-score
+exceeds 3.0. WindowSpikeDetector checks each 1-minute window mean against
+last 30 window means, fires alert if sustained drift detected. Composite
+AnomalyDetector wraps both into one entry point.
+
+pipeline.py - The factory floor manager. Pure orchestration, zero business
+logic. Connects all components in sequence: get message, check if
+malformed, check if duplicate, check per-record anomaly, add to
+aggregator, flush every 10 seconds, check window anomalies, emit results.
+Handles graceful shutdown on SIGINT/SIGTERM.
+
+main.py - The on switch. Seven lines. Sets up logging, prints config,
+calls pipeline.run().
+
+tests.py - 23 unit tests all passing. Covers parsing, deduplication, 
+aggregation, and anomaly detection.
+
+-----------------------------------------------------------------------
+WHY Z-SCORE AND NOT OTHER ALGORITHMS
+-----------------------------------------------------------------------
+
+Z-score was chosen for four reasons:
+1. No training data required - works from first 10 readings unlike
+   Isolation Forest which needs historical batch training
+2. Truly streaming - computes in O(1) per record
+3. Human interpretable - can tell an engineer this reading was 4.5 sigma
+   from normal and they immediately understand severity
+4. Stateless per sensor - each sensor maintains its own rolling window
+   independently
+
+Why not Isolation Forest: requires batch training on historical data first.
+Cannot use on day one with no history. At HPCL we used Isolation Forest
+for corrosion detection because we had years of labeled training data. For
+a fresh streaming pipeline, Z-score is the right choice for cold start.
+
+Why not LSTM Autoencoder: needs GPU, training pipeline, model versioning,
+retraining schedule. Massive operational overhead.
+
+Why not One-Class SVM: not designed for streaming, needs retraining as
+normal behaviour drifts.
+
+Alternative worth mentioning: EWMA (Exponentially Weighted Moving Average)
+would be a strong production upgrade. Gives more weight to recent readings,
+adapts to slow drift. Would mention as first production improvement.
+
+-----------------------------------------------------------------------
+THE DEDUPLICATOR DATA STRUCTURE EXPLAINED
+-----------------------------------------------------------------------
+
+Two structures used together because no single structure gives both O(1)
+lookup AND O(1) eviction.
+
+Dict alone - fast lookup, but finding expired entries requires scanning
+everything - O(n).
+
+Deque alone - perfect eviction order (oldest always at front), but O(n)
+lookup by key.
+
+Together - dict gives O(1) lookup, deque gives O(1) eviction. The cost is
+double memory - each message_id stored in both structures. At maximum
+100,000 entries this is roughly 30 MB total. Completely negligible on any
+modern server. The CPU saving from O(1) eviction is worth far more than
+15 MB of RAM at high throughput.
+
+-----------------------------------------------------------------------
+THE TUMBLING WINDOW EXPLAINED
+-----------------------------------------------------------------------
+
+A tumbling window is non-overlapping and fixed size. Window 1: 08:30:00
+to 08:31:00. Window 2: 08:31:00 to 08:32:00. Every reading belongs to
+exactly one window. Like shift reports - morning shift, afternoon shift,
+night shift. No reading counted in two shifts.
+
+The boundary bug avoided: collect values within the window boundary first,
+then prune those entries from the buffer. Reset window start to the
+boundary timestamp not to now. If you reset to now, windows drift over
+time and you lose data on boundaries.
+
+-----------------------------------------------------------------------
+WELFORD'S ALGORITHM
+-----------------------------------------------------------------------
+
+Welford's is an online algorithm for computing mean and variance
+incrementally one data point at a time without accumulating full history
+in memory. Numerically stable - avoids catastrophic cancellation when
+values are large and variance is small. O(1) per update, O(1) memory.
+
+In our code: WelfordStats class is defined in anomaly.py but the
+RollingZScoreDetector actually recomputes mean and variance directly from
+the 20-value buffer on each inspection. This is fine because at 20 values
+direct recomputation is negligible. WelfordStats is documented as the
+upgrade path for unbounded streams where you cannot store historical values.
+
+-----------------------------------------------------------------------
+THE TWO ANOMALY DETECTORS AND WHY BOTH ARE NEEDED
+-----------------------------------------------------------------------
+
+Per-record Z-score catches sudden spikes: a pressure reading that instantly
+jumps from 11 bar to 45 bar. Fires within one second of anomalous reading.
+Maps to mechanical events - valve slam, pump cavitation, pressure surge.
+
+Window spike detector catches sustained drift: a sensor running 2 bar high
+for 30 consecutive minutes. Each individual reading might be within 3 sigma
+of its local baseline but compared to 30-window historical norm the
+sustained elevation is clearly anomalous. Maps to calibration drift, slow
+leak, gradual blockage.
+
+Neither alone is sufficient. Together they cover the full range of real
+industrial anomalies.
+
+-----------------------------------------------------------------------
+EXACTLY-ONCE SEMANTICS EXPLAINED
+-----------------------------------------------------------------------
+
+Kafka guarantees at-least-once delivery - it would rather send a message
+twice than risk losing it. This creates duplicates.
+
+Our pipeline uses manual offset commit - the Kafka offset (bookmark) only
+advances after the record has been fully processed. If the pipeline crashes
+mid-processing, Kafka redelivers the message.
+
+Combined with the deduplicator, this gives effectively exactly-once
+semantics: Kafka provides at-least-once delivery, deduplicator handles
+resulting duplicates idempotently. The record is processed exactly once
+even if delivered multiple times.
+
+-----------------------------------------------------------------------
+SWITCHING FROM DEMO TO PRODUCTION - THREE LAYERS
+-----------------------------------------------------------------------
+
+Layer 1 - Flip the boolean in config.py:
+simulate: bool = False
+
+Layer 2 - Update KafkaConfig with real broker address and topic name.
+bootstrap_servers to real broker. topic to name agreed with SCADA team.
+enable_auto_commit must always stay False.
+
+Layer 3 - Use environment variables so broker address never goes to GitHub:
+os.getenv("KAFKA_BROKER", "localhost:9092")
+Set on production server: export KAFKA_BROKER=kafka-prod.plant.internal:9092
+
+Zero changes to deduplicator, aggregator, anomaly detector, or pipeline
+orchestration. Pipeline logic is completely decoupled from data source.
+
+-----------------------------------------------------------------------
+PRODUCTION UPGRADES BEYOND CONFIG
+-----------------------------------------------------------------------
+
+Deduplicator state: move from in-memory dict to Redis with TTL keys so
+multiple consumer instances share dedup state.
+
+Aggregator state: move from in-memory deques to Kafka Streams or Flink
+state store so windows survive consumer restarts.
+
+Alert sink: replace print with PagerDuty and Slack webhooks.
+
+Window sink: replace print with TimescaleDB or InfluxDB writer.
+
+Schema validation: add Avro plus Schema Registry instead of manual field
+checks.
+
+Observability: add Prometheus metrics and Grafana dashboards.
+
+Anomaly baseline: add EWMA and periodic Isolation Forest retraining.
+
+Scaling: Kafka partition-per-sensor plus N consumer instances.
+
+-----------------------------------------------------------------------
+HPCL CONNECTION TO THIS PROJECT
+-----------------------------------------------------------------------
+
+At HPCL I deployed two IoT anomaly detection systems in production.
+
+First: IoT sensor bottom corrosion detection using Isolation Forest on
+continuous sensor streams from electromagnetic sensors - closing a safety
+blind spot completely undetectable by human inspection across 1.5 million
+daily cylinder operations.
+
+Second: Predictive maintenance system across 55 plants using continuous
+IoT sensor data with dual-layer rule-based and ML alerting replacing
+manual gauge monitoring.
+
+The mass flow meter parameters in this project - pressure 8.5 to 14.5 bar,
+flow 2,000 to 5,600 kg/h, LPG density 508 to 522 kg/m3 - are modelled on
+real LPG transfer line specifications. Plant names KDL, RJY, MNG are
+Kondapalli, Rajahmundry, and Mangalore - three of my actual postings.
+
+-----------------------------------------------------------------------
+OPENING LINE FOR INTERVIEW
+-----------------------------------------------------------------------
+
+I read the assessment brief before coming in. The core problem of
+streaming telemetry deduplication, aggregation, and anomaly detection is
+something I have built at production scale at HPCL across 55 plants.
+So I went ahead and built the Python pipeline architecture for it.
+Want me to walk you through it?
+
+Then open: github.com/Kokkisa/telemetry-anomaly-pipeline
+
+=======================================================================
+END OF EXPLANATIONS DOCUMENT
+=======================================================================

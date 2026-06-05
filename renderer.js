@@ -220,7 +220,6 @@ const heardEl      = $('#heard-text');
 const answerEl     = $('#answer-text');
 const answerSpin   = $('#answer-spinner');
 const answerBadge  = $('#answer-badge');
-const btnPromote   = $('#btn-promote');
 const historyList  = $('#history-list');
 const apiKeyInput      = $('#api-key');
 const claudeKeyInput   = $('#claude-key');
@@ -244,25 +243,6 @@ const docListEl        = $('#doc-list');
 const docEmptyEl       = $('#doc-empty');
 const storageBarFillEl = $('#storage-bar-fill');
 const storageUsageText = $('#storage-usage-text');
-
-// Q&A Bank (Tab 3)
-const qaForm           = $('#qa-form');
-const qaFormTitle      = $('#qa-form-title');
-const qaFormQuestion   = $('#qa-form-question');
-const qaFormAnswer     = $('#qa-form-answer');
-const qaFormStatus     = $('#qa-form-status');
-const btnQaSave        = $('#btn-qa-save');
-const btnQaCancel      = $('#btn-qa-cancel');
-const btnAddTier1      = $('#btn-add-tier1');
-const btnImportTier1   = $('#btn-import-tier1');
-const btnEmbedAllTier1 = $('#btn-embed-all-tier1');
-const btnClearTier2    = $('#btn-clear-tier2');
-const tier1ListEl      = $('#tier1-list');
-const tier2ListEl      = $('#tier2-list');
-const tier1EmptyEl     = $('#tier1-empty');
-const tier2EmptyEl     = $('#tier2-empty');
-const qaBulkStatusEl   = $('#qa-bulk-status');
-const qaStatsEl        = $('#qa-stats');
 
 // v0.3.0 — Pill tab switcher + Screen panel
 const pillBarEl           = $('#pill-bar');
@@ -312,8 +292,6 @@ const state = {
   unhookMute:   null,
   convHistory:  [],              // [{role, content}]
   exchanges:    [],              // [{q, a, source, tier2Id?}] — for history list
-  currentTier2Id: null,          // last Tier 2 entry id painted in the answer panel
-                                 // (drives the Promote ↑ button's target)
   // v0.3.0 — Coding Mode. True between a screen-capture hotkey press and
   // user dismissing the screen panel (clearing the answer). Forces the
   // session-panel to stay expanded so the screen tab is visible.
@@ -429,594 +407,6 @@ function setActiveTab(name) {
   for (const pane of tabPanes) {
     pane.classList.toggle('active', pane.id === `tab-${name}`);
   }
-}
-
-// =====================================================================
-// Q&A BANK — Tier 1 + Tier 2 storage + UI (Tab 3)
-// =====================================================================
-
-// Tier writers (the getters live up in the UTILITIES section). Both
-// return Promises now; await them when ordering against subsequent
-// reads matters (the embed-all loop does; quick UI mutations don't).
-const setTier1 = (entries) => storeSet('ca_tier1', entries);
-const setTier2 = (entries) => storeSet('ca_tier2', entries);
-
-function newTier1Id() { return 't1_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6); }
-function todayIso()   { return new Date().toISOString().slice(0, 10); }
-
-// ---- form state ----
-// qaFormMode: 'add-tier1' | 'edit-tier1' | 'promote-tier2' | null
-// qaFormEditingId: id of the entry being edited / promoted (or null for add)
-// qaFormOriginal: { question, embedding } captured at form open — lets save
-//                  preserve the embedding when the question text is unchanged.
-let qaFormMode = null;
-let qaFormEditingId = null;
-let qaFormOriginal = null;
-
-function showQaForm(visible) {
-  qaForm.style.display = visible ? '' : 'none';
-}
-
-function setQaFormStatus(msg) {
-  qaFormStatus.textContent = msg || '';
-}
-
-function startAddTier1() {
-  qaFormMode = 'add-tier1';
-  qaFormEditingId = null;
-  qaFormOriginal = null;
-  qaFormTitle.textContent = 'Add Tier 1 pair';
-  qaFormQuestion.value = '';
-  qaFormAnswer.value = '';
-  setQaFormStatus('');
-  showQaForm(true);
-  qaFormQuestion.focus();
-}
-
-function startEditTier1(id) {
-  const entry = getTier1().find(e => e.id === id);
-  if (!entry) return;
-  qaFormMode = 'edit-tier1';
-  qaFormEditingId = id;
-  qaFormOriginal = { question: entry.question, embedding: entry.embedding };
-  qaFormTitle.textContent = 'Edit Tier 1 pair';
-  qaFormQuestion.value = entry.question;
-  qaFormAnswer.value = entry.answer;
-  setQaFormStatus('');
-  showQaForm(true);
-  qaFormQuestion.focus();
-}
-
-function startPromoteTier2(id) {
-  const entry = getTier2().find(e => e.id === id);
-  if (!entry) return;
-  qaFormMode = 'promote-tier2';
-  qaFormEditingId = id;
-  qaFormOriginal = { question: entry.question, embedding: entry.embedding };
-  qaFormTitle.textContent = 'Promote to Tier 1 — rewrite in your own voice';
-  qaFormQuestion.value = entry.question;
-  qaFormAnswer.value = entry.answer;
-  setQaFormStatus('');
-  showQaForm(true);
-  qaFormAnswer.focus();  // promote = rewrite answer, so focus there
-}
-
-function cancelQaForm() {
-  qaFormMode = null;
-  qaFormEditingId = null;
-  qaFormOriginal = null;
-  showQaForm(false);
-  setQaFormStatus('');
-}
-
-function saveQaForm() {
-  const q = qaFormQuestion.value.trim();
-  const a = qaFormAnswer.value.trim();
-  if (!q || !a) {
-    setQaFormStatus('Both question and answer are required.');
-    return;
-  }
-
-  if (qaFormMode === 'add-tier1') {
-    const tier1 = getTier1();
-    tier1.push({
-      id: newTier1Id(),
-      question: q,
-      answer: a,
-      embedding: null,
-      source: 'manual',
-      created: todayIso()
-    });
-    setTier1(tier1);
-
-  } else if (qaFormMode === 'edit-tier1') {
-    const tier1 = getTier1();
-    const idx = tier1.findIndex(e => e.id === qaFormEditingId);
-    if (idx >= 0) {
-      const entry = tier1[idx];
-      // If the question changed, the existing embedding no longer matches.
-      const qChanged = qaFormOriginal && qaFormOriginal.question !== q;
-      tier1[idx] = {
-        ...entry,
-        question: q,
-        answer: a,
-        embedding: qChanged ? null : entry.embedding
-      };
-      setTier1(tier1);
-    }
-
-  } else if (qaFormMode === 'promote-tier2') {
-    const tier1 = getTier1();
-    const tier2 = getTier2();
-    // Reuse the Tier 2 embedding if the question wasn't edited; otherwise
-    // clear it — Tier 1 has its own per-entry Embed button.
-    const qUnchanged = qaFormOriginal && qaFormOriginal.question === q;
-    tier1.push({
-      id: newTier1Id(),
-      question: q,
-      answer: a,
-      embedding: qUnchanged ? qaFormOriginal.embedding : null,
-      source: 'manual',
-      created: todayIso()
-    });
-    setTier1(tier1);
-    setTier2(tier2.filter(e => e.id !== qaFormEditingId));
-  }
-
-  cancelQaForm();
-  renderQaBank();
-}
-
-// ---- Embed (Tier 1 only — Tier 2 entries are embedded by autoCache) ----
-async function embedTier1Entry(id) {
-  const tier1 = getTier1();
-  const idx = tier1.findIndex(e => e.id === id);
-  if (idx < 0) return;
-
-  // Optimistic UI update — paint 'Embedding...' on the matching row.
-  const itemEl = tier1ListEl.querySelector(`.qa-item[data-id="${id}"]`);
-  const statusEl = itemEl && itemEl.querySelector('.qa-item-status');
-  if (statusEl) {
-    statusEl.textContent = 'Embedding...';
-    statusEl.className = 'qa-item-status embedding';
-  }
-
-  try {
-    const embedding = await embedText(tier1[idx].question);
-    // Re-read in case the array changed during the await.
-    const fresh = getTier1();
-    const j = fresh.findIndex(e => e.id === id);
-    if (j >= 0) {
-      fresh[j].embedding = embedding;
-      setTier1(fresh);
-    }
-    renderQaBank();
-  } catch (err) {
-    console.error('Embed failed:', err);
-    if (statusEl) {
-      statusEl.textContent = 'Embed failed: ' + (err.message || 'unknown error');
-      statusEl.className = 'qa-item-status error';
-    }
-  }
-}
-
-// ---- Delete / toggle reviewed / clear all ----
-function deleteTier1Entry(id) {
-  if (!confirm('Delete this Tier 1 pair?')) return;
-  setTier1(getTier1().filter(e => e.id !== id));
-  renderQaBank();
-}
-
-function deleteTier2Entry(id) {
-  if (!confirm('Delete this cached answer?')) return;
-  setTier2(getTier2().filter(e => e.id !== id));
-  renderQaBank();
-}
-
-function toggleTier2Reviewed(id) {
-  const tier2 = getTier2();
-  const entry = tier2.find(e => e.id === id);
-  if (!entry) return;
-  entry.reviewed = !entry.reviewed;
-  setTier2(tier2);
-  renderQaBank();
-}
-
-function clearTier2() {
-  if (!confirm('Clear all auto-cached answers? This cannot be undone.')) return;
-  setTier2([]);
-  renderQaBank();
-}
-
-// ---- Bulk import + bulk embed (Tier 1) -------------------------------
-// Parse format:
-//   GROUP: <name>          (optional; applies to all following Q/A until
-//                           the next GROUP line; defaults to '')
-//   Q: <question>
-//   A: <answer>            (continuation lines until next Q/GROUP/EOF
-//                           become part of the answer)
-// Lines outside a Q/A block are ignored. Empty Q or A drops the pair.
-function parseQaTxt(text) {
-  const lines = String(text || '').split(/\r?\n/);
-  const pairs = [];
-  let currentGroup = '';
-  let currentQ = null;
-  let currentA = null;  // null = not yet collecting; string = collecting
-
-  const flush = () => {
-    if (currentQ !== null && currentA !== null) {
-      const q = currentQ.trim();
-      const a = currentA.trim();
-      if (q && a) pairs.push({ question: q, answer: a, group: currentGroup });
-    }
-    currentQ = null;
-    currentA = null;
-  };
-
-  for (const raw of lines) {
-    const trimmed = raw.trim();
-    if (/^GROUP\s*:/i.test(trimmed)) {
-      flush();
-      currentGroup = trimmed.replace(/^GROUP\s*:/i, '').trim();
-    } else if (/^Q\s*:/i.test(trimmed)) {
-      flush();
-      currentQ = trimmed.replace(/^Q\s*:/i, '').trim();
-      currentA = null;
-    } else if (/^A\s*:/i.test(trimmed)) {
-      if (currentQ !== null) {
-        currentA = trimmed.replace(/^A\s*:/i, '').trim();
-      }
-    } else if (currentA !== null) {
-      // Continuation of the current answer — preserve as a new line.
-      currentA += '\n' + raw;
-    }
-  }
-  flush();
-  return pairs;
-}
-
-function setQaBulkStatus(msg) {
-  if (msg) {
-    qaBulkStatusEl.textContent = msg;
-    qaBulkStatusEl.style.display = '';
-  } else {
-    qaBulkStatusEl.style.display = 'none';
-    qaBulkStatusEl.textContent = '';
-  }
-}
-
-async function importTier1FromTxt() {
-  if (!window.electronAPI || !window.electronAPI.openTxtDialog || !window.electronAPI.readTxt) {
-    setQaBulkStatus('Import unavailable — Electron IPC not ready.');
-    return;
-  }
-
-  const filePath = await window.electronAPI.openTxtDialog();
-  if (!filePath) return;
-
-  setQaBulkStatus('Reading file...');
-  const result = await window.electronAPI.readTxt(filePath);
-  if (result.error) {
-    setQaBulkStatus(`Failed to read file: ${result.error}`);
-    return;
-  }
-
-  const pairs = parseQaTxt(result.text || '');
-  if (pairs.length === 0) {
-    setQaBulkStatus(
-      `No Q&A pairs found in ${result.filename}. Expected GROUP/Q/A format.`
-    );
-    return;
-  }
-
-  const ok = confirm(
-    `Import ${pairs.length} Q&A pair${pairs.length === 1 ? '' : 's'} ` +
-    `from ${result.filename} into Tier 1?`
-  );
-  if (!ok) {
-    setQaBulkStatus('');
-    return;
-  }
-
-  const tier1 = getTier1();
-  for (const p of pairs) {
-    tier1.push({
-      id: newTier1Id(),
-      question: p.question,
-      answer: p.answer,
-      embedding: null,
-      source: 'import',
-      group: p.group || '',
-      created: todayIso()
-    });
-  }
-  setTier1(tier1);
-  renderQaBank();
-
-  setQaBulkStatus(
-    `Imported ${pairs.length} pair${pairs.length === 1 ? '' : 's'} — ` +
-    `click "Embed all unembedded" to make them searchable.`
-  );
-}
-
-// ---- Tunables for the bulk embed loop -------------------------------
-// 300 ms between calls keeps us under OpenAI's rate-limit pulses for
-// text-embedding-3-small on the basic API tier (~3 RPS sustained is
-// safe and well below the burst ceiling). 10 s is a generous per-call
-// ceiling — a healthy embedding round-trip is well under 1 s, so a
-// timeout this large only fires on real network stalls. Batch size of
-// 50 controls UX cadence; disk writes happen per-entry inside the loop
-// via setTier1 -> storeSet -> set-store IPC, so progress is durable on
-// disk even if the renderer is closed or crashes mid-batch.
-const EMBED_BATCH_SIZE = 50;
-const EMBED_DELAY_MS   = 300;
-const EMBED_TIMEOUT_MS = 10000;
-
-// Sequential + paced + per-call timeout. Resumable: any Tier 1 entry
-// whose embedding is still null after this run can be retried by
-// clicking the button again — storage is updated after every successful
-// call.
-//
-// Error policy:
-// - Timeout (10s, AbortError) → skip that entry, increment skipped,
-//   continue. This is what the "never freeze" requirement looks like.
-// - Other errors (auth, quota, network failure) → abort the whole loop
-//   with a resumable status, so the user can fix the underlying issue
-//   and click again. Retrying every entry against a broken key would
-//   just burn time and produce 200 identical errors.
-async function embedAllTier1Unembedded() {
-  const targets = getTier1().filter(e => !e.embedding);
-  if (targets.length === 0) {
-    setQaBulkStatus('All Tier 1 entries are already embedded.');
-    setTimeout(() => setQaBulkStatus(''), 2000);
-    return;
-  }
-
-  btnImportTier1.disabled = true;
-  btnEmbedAllTier1.disabled = true;
-  btnAddTier1.disabled = true;
-
-  const total = targets.length;
-  const totalBatches = Math.ceil(total / EMBED_BATCH_SIZE);
-  let done = 0;
-  let skipped = 0;
-
-  try {
-    for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
-      const batchStart = batchIdx * EMBED_BATCH_SIZE;
-      const batchEnd   = Math.min(batchStart + EMBED_BATCH_SIZE, total);
-      const batch      = targets.slice(batchStart, batchEnd);
-
-      for (let i = 0; i < batch.length; i++) {
-        const target  = batch[i];
-        const overall = batchStart + i + 1;
-        setQaBulkStatus(
-          `Batch ${batchIdx + 1}/${totalBatches} — embedding ${overall}/${total}` +
-          (skipped > 0 ? ` · ${skipped} skipped` : '')
-        );
-
-        // AbortController gives us a hard cancel that actually tears down
-        // the fetch (and releases the socket) instead of letting a hung
-        // request linger in the background.
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), EMBED_TIMEOUT_MS);
-
-        try {
-          const emb = await embedText(target.question, { signal: controller.signal });
-          clearTimeout(timeoutId);
-          const cur = getTier1();
-          const idx = cur.findIndex(e => e.id === target.id);
-          if (idx >= 0) {
-            cur[idx].embedding = emb;
-            // Await — guarantees this entry is on disk before the next
-            // call starts, so a renderer crash or kill mid-batch never
-            // loses a successful embed.
-            await setTier1(cur);
-          }
-          done++;
-        } catch (err) {
-          clearTimeout(timeoutId);
-          // AbortError = our 10s timeout. Skip and continue, never freeze.
-          // Some Electron versions surface the abort as a TypeError with
-          // 'aborted' in the message, so check both.
-          const aborted = err && (err.name === 'AbortError' || /aborted/i.test(err.message || ''));
-          if (aborted) {
-            skipped++;
-            console.warn(
-              `Embed timeout on entry ${target.id} (${overall}/${total}) — skipped.`
-            );
-          } else {
-            setQaBulkStatus(
-              `Embed failed at ${overall}/${total}: ${err.message}. ` +
-              `Click again to resume.`
-            );
-            renderQaBank();
-            return;
-          }
-        }
-
-        // Pace within the batch — last call in a batch doesn't sleep
-        // because the batch-boundary block below handles that.
-        if (i < batch.length - 1) {
-          await sleep(EMBED_DELAY_MS);
-        }
-      }
-
-      // Batch boundary: refresh the per-row indicators in the visible
-      // Tier 1 list and announce the batch milestone.
-      renderQaBank();
-      if (batchIdx < totalBatches - 1) {
-        setQaBulkStatus(
-          `Batch ${batchIdx + 1}/${totalBatches} done — ` +
-          `${done} embedded · ${skipped} skipped. Continuing...`
-        );
-        await sleep(EMBED_DELAY_MS);
-      }
-    }
-
-    const tail = skipped > 0
-      ? ` · ${skipped} skipped (click again to retry)`
-      : '';
-    setQaBulkStatus(`Embedded ${done}/${total} entries${tail}.`);
-    setTimeout(() => setQaBulkStatus(''), 4000);
-  } finally {
-    btnImportTier1.disabled = false;
-    btnAddTier1.disabled = false;
-    // btnEmbedAllTier1's disabled state is re-derived by renderTier1().
-    renderQaBank();
-  }
-}
-
-// ---- Rendering ----
-function renderQaBank() {
-  renderTier1();
-  renderTier2();
-  renderQaStats();
-}
-
-function renderTier1() {
-  const entries = getTier1();
-  tier1ListEl.innerHTML = '';
-  for (const entry of entries) {
-    tier1ListEl.appendChild(buildTier1Item(entry));
-  }
-  tier1EmptyEl.style.display = entries.length === 0 ? '' : 'none';
-
-  const pending = entries.filter(e => !e.embedding).length;
-  btnEmbedAllTier1.disabled = pending === 0;
-  btnEmbedAllTier1.textContent = pending > 0
-    ? `Embed all unembedded (${pending})`
-    : 'Embed all unembedded';
-}
-
-function renderTier2() {
-  const entries = getTier2();
-  tier2ListEl.innerHTML = '';
-  // Most recent first — cache builds up over time so newest is most relevant.
-  for (const entry of [...entries].reverse()) {
-    tier2ListEl.appendChild(buildTier2Item(entry));
-  }
-  tier2EmptyEl.style.display = entries.length === 0 ? '' : 'none';
-}
-
-function renderQaStats() {
-  const t1 = getTier1().length;
-  const t2 = getTier2().length;
-  qaStatsEl.textContent = `Tier 1: ${t1} pair${t1 === 1 ? '' : 's'} · Tier 2: ${t2} pair${t2 === 1 ? '' : 's'}`;
-}
-
-function buildTier1Item(entry) {
-  const root = document.createElement('div');
-  root.className = 'qa-item';
-  root.dataset.id = entry.id;
-
-  const q = document.createElement('div');
-  q.className = 'qa-item-q';
-  q.textContent = entry.question;
-  root.appendChild(q);
-
-  const a = document.createElement('div');
-  a.className = 'qa-item-a';
-  a.textContent = entry.answer;
-  root.appendChild(a);
-
-  const meta = document.createElement('div');
-  meta.className = 'qa-item-meta';
-  const status = document.createElement('span');
-  status.className = 'qa-item-status ' + (entry.embedding ? 'embedded' : 'unembedded');
-  status.textContent = entry.embedding ? 'Embedded' : 'Not embedded';
-  meta.appendChild(status);
-  const date = document.createElement('span');
-  date.textContent = entry.created || '';
-  meta.appendChild(date);
-  root.appendChild(meta);
-
-  const actions = document.createElement('div');
-  actions.className = 'qa-item-actions';
-
-  const embedBtn = document.createElement('button');
-  embedBtn.type = 'button';
-  embedBtn.className = 'btn-mini';
-  embedBtn.dataset.action = 'embed';
-  embedBtn.textContent = entry.embedding ? 'Re-embed' : 'Embed';
-  actions.appendChild(embedBtn);
-
-  const editBtn = document.createElement('button');
-  editBtn.type = 'button';
-  editBtn.className = 'btn-mini';
-  editBtn.dataset.action = 'edit';
-  editBtn.textContent = 'Edit';
-  actions.appendChild(editBtn);
-
-  const delBtn = document.createElement('button');
-  delBtn.type = 'button';
-  delBtn.className = 'btn-mini btn-danger';
-  delBtn.dataset.action = 'delete';
-  delBtn.textContent = 'Delete';
-  actions.appendChild(delBtn);
-
-  root.appendChild(actions);
-  return root;
-}
-
-function buildTier2Item(entry) {
-  const root = document.createElement('div');
-  root.className = 'qa-item tier2';
-  root.dataset.id = entry.id;
-
-  const q = document.createElement('div');
-  q.className = 'qa-item-q';
-  q.textContent = entry.question;
-  root.appendChild(q);
-
-  const a = document.createElement('div');
-  a.className = 'qa-item-a';
-  a.textContent = entry.answer;
-  root.appendChild(a);
-
-  const meta = document.createElement('div');
-  meta.className = 'qa-item-meta';
-  if (entry.reviewed) {
-    const badge = document.createElement('span');
-    badge.className = 'qa-item-badge reviewed';
-    badge.textContent = 'Reviewed';
-    meta.appendChild(badge);
-  }
-  const status = document.createElement('span');
-  status.className = 'qa-item-status ' + (entry.embedding ? 'embedded' : 'unembedded');
-  status.textContent = entry.embedding ? 'Embedded' : 'No embedding';
-  meta.appendChild(status);
-  const date = document.createElement('span');
-  date.textContent = entry.created || '';
-  meta.appendChild(date);
-  root.appendChild(meta);
-
-  const actions = document.createElement('div');
-  actions.className = 'qa-item-actions';
-
-  const promoteBtn = document.createElement('button');
-  promoteBtn.type = 'button';
-  promoteBtn.className = 'btn-mini btn-promote';
-  promoteBtn.dataset.action = 'promote';
-  promoteBtn.textContent = '↑ Promote';
-  actions.appendChild(promoteBtn);
-
-  const reviewBtn = document.createElement('button');
-  reviewBtn.type = 'button';
-  reviewBtn.className = 'btn-mini';
-  reviewBtn.dataset.action = 'review';
-  reviewBtn.textContent = entry.reviewed ? 'Unmark' : 'Mark reviewed';
-  actions.appendChild(reviewBtn);
-
-  const delBtn = document.createElement('button');
-  delBtn.type = 'button';
-  delBtn.className = 'btn-mini btn-danger';
-  delBtn.dataset.action = 'delete';
-  delBtn.textContent = 'Delete';
-  actions.appendChild(delBtn);
-
-  root.appendChild(actions);
-  return root;
 }
 
 // =====================================================================
@@ -1340,17 +730,15 @@ function setStatus(color, label) {
 
 // Source badge on the assistant section. Called after every successful
 // transcript (tier1/tier2/ai) and when a history item is restored.
-// Pass source=null to clear the badge and hide the Promote button.
+// Pass source=null to clear the badge.
 //
-// Uses explicit display values ('inline-flex' / 'inline-block') rather
-// than '' to avoid any browser-edge-case ambiguity around clearing the
-// inline display property the HTML starts with (style="display: none").
-function setAnswerBadge(source, tier2Id) {
+// Uses explicit display values ('inline-flex') rather than '' to avoid
+// any browser-edge-case ambiguity around clearing the inline display
+// property the HTML starts with (style="display: none").
+function setAnswerBadge(source) {
   answerBadge.className = 'answer-badge';
   answerBadge.textContent = '';
   answerBadge.style.display = 'none';
-  btnPromote.style.display = 'none';
-  state.currentTier2Id = null;
 
   if (!source) return;
 
@@ -1362,8 +750,6 @@ function setAnswerBadge(source, tier2Id) {
     answerBadge.classList.add('badge-tier2');
     answerBadge.textContent = '⚡ Cached';
     answerBadge.style.display = 'inline-flex';
-    btnPromote.style.display = 'inline-block';
-    state.currentTier2Id = tier2Id || null;
   } else if (source === 'ai') {
     const provider = storeGet(LS_KEY.provider) || 'openai';
     if (provider === 'claude') {
@@ -1437,15 +823,7 @@ function renderHistory() {
     div.addEventListener('click', () => {
       heardEl.textContent  = ex.q;
       answerEl.textContent = ex.a;
-      setAnswerBadge(ex.source, ex.tier2Id);
-      // Belt-and-suspenders: explicitly re-assert the Promote button +
-      // currentTier2Id for Tier 2 exchanges so the button is guaranteed
-      // visible on history restore regardless of whatever setAnswerBadge
-      // happens to do with display semantics.
-      if (ex.source === 'tier2' && ex.tier2Id) {
-        state.currentTier2Id = ex.tier2Id;
-        btnPromote.style.display = 'inline-block';
-      }
+      setAnswerBadge(ex.source);
     });
     historyList.appendChild(div);
   }
@@ -1669,8 +1047,6 @@ async function processTranscript(transcript, exchange) {
   // produced an answer (skip on stream errors / empty replies).
   if (embedding && exchange.a) {
     autoCache(transcript, embedding, exchange.a);
-    // Live-update the Q&A Bank tab in case the user is looking at it.
-    renderQaBank();
   }
 }
 
@@ -2142,24 +1518,6 @@ btnClear.addEventListener('click', () => {
   clearSession();
 });
 
-// Promote ↑ — visible only when the current answer came from Tier 2.
-// Opens the settings panel on the Q&A tab with the promote form prefilled
-// from the matched Tier 2 entry.
-btnPromote.addEventListener('click', () => {
-  const id = state.currentTier2Id;
-  if (!id) return;
-  // Guard against the entry having been deleted (e.g. via Clear all) since
-  // it was painted in the answer panel.
-  if (!getTier2().some(e => e.id === id)) {
-    setAnswerBadge(null);
-    return;
-  }
-  state.settingsOpen = true;
-  setActiveTab('qa');
-  refreshLayout();
-  startPromoteTier2(id);
-});
-
 btnSave.addEventListener('click', () => {
   saveSettings();
 });
@@ -2188,37 +1546,6 @@ docListEl.addEventListener('click', (e) => {
   const action = btn.dataset.action;
   if      (action === 're-embed') reEmbedFile(source);
   else if (action === 'delete')   deleteFile(source);
-});
-
-// ---- Q&A Bank wiring ----
-btnAddTier1.addEventListener('click', startAddTier1);
-btnImportTier1.addEventListener('click', importTier1FromTxt);
-btnEmbedAllTier1.addEventListener('click', embedAllTier1Unembedded);
-btnClearTier2.addEventListener('click', clearTier2);
-btnQaSave.addEventListener('click', saveQaForm);
-btnQaCancel.addEventListener('click', cancelQaForm);
-
-// Event delegation for dynamically-rendered list items.
-tier1ListEl.addEventListener('click', (e) => {
-  const btn = e.target.closest('button[data-action]');
-  if (!btn) return;
-  const id = btn.closest('.qa-item')?.dataset.id;
-  if (!id) return;
-  const action = btn.dataset.action;
-  if      (action === 'embed')  embedTier1Entry(id);
-  else if (action === 'edit')   startEditTier1(id);
-  else if (action === 'delete') deleteTier1Entry(id);
-});
-
-tier2ListEl.addEventListener('click', (e) => {
-  const btn = e.target.closest('button[data-action]');
-  if (!btn) return;
-  const id = btn.closest('.qa-item')?.dataset.id;
-  if (!id) return;
-  const action = btn.dataset.action;
-  if      (action === 'promote') startPromoteTier2(id);
-  else if (action === 'review')  toggleTier2Reviewed(id);
-  else if (action === 'delete')  deleteTier2Entry(id);
 });
 
 // =====================================================================
@@ -2998,7 +2325,7 @@ if (window.electronAPI && window.electronAPI.onHotkeySubmit) {
 
 // ---------- Boot ----------
 // Async because the disk store has to hydrate the in-memory cache
-// before any storeGet() in loadSettings / renderQaBank / renderDocList
+// before any storeGet() in loadSettings / renderDocList
 // can return real values. While we wait, the pill UI already shows the
 // idle state from its inline class, so there's no perceptible delay.
 (async () => {
@@ -3008,7 +2335,6 @@ if (window.electronAPI && window.electronAPI.onHotkeySubmit) {
     console.error('Store hydrate failed — falling back to defaults:', err);
   }
   loadSettings();
-  renderQaBank();
   renderDocList();
   renderStorageBar();
   refreshQueueUI();   // v0.3.2 — initialize 📸 badge, Submit label, queue bar hidden
